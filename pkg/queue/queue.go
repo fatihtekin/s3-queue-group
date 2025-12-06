@@ -1,17 +1,13 @@
 package queue
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"math/rand"
-	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
 )
@@ -46,13 +42,18 @@ type S3QueueConfig struct {
 	Metrics      MetricsReporter
 }
 
-// S3Queue implements a log-structured queue using S3.
+// S3Queue implements a log-structured queue using S3 with pluggable components.
 type S3Queue struct {
-	client S3API
-	cfg    S3QueueConfig
+	publisher    Publisher
+	locker       Locker
+	checkpoint   CheckpointStore
+	retryManager RetryManager
+	messages     MessageStore
+	metrics      MetricsReporter
+	cfg          S3QueueConfig
 }
 
-// NewS3Queue creates a new S3Queue.
+// NewS3Queue creates a new S3Queue with injected dependencies.
 func NewS3Queue(client S3API, cfg S3QueueConfig) *S3Queue {
 	if cfg.Shards <= 0 {
 		cfg.Shards = 1
@@ -69,9 +70,17 @@ func NewS3Queue(client S3API, cfg S3QueueConfig) *S3Queue {
 	if cfg.Metrics == nil {
 		cfg.Metrics = &NoopMetricsReporter{}
 	}
+
+	messages := NewS3MessageStore(client, cfg.Bucket, cfg.QueueName)
+
 	return &S3Queue{
-		client: client,
-		cfg:    cfg,
+		publisher:    NewS3Publisher(messages, cfg.Metrics, cfg.Shards, cfg.QueueName),
+		locker:       NewS3Locker(client, cfg.Bucket, cfg.QueueName, cfg.LockTTL),
+		checkpoint:   NewS3CheckpointStore(client, cfg.Bucket, cfg.QueueName),
+		retryManager: NewS3RetryManager(client, cfg.Bucket, cfg.QueueName, cfg.MaxRetries),
+		messages:     messages,
+		metrics:      cfg.Metrics,
+		cfg:          cfg,
 	}
 }
 
@@ -81,36 +90,7 @@ func init() {
 
 // Publish sends a message to the queue.
 func (q *S3Queue) Publish(ctx context.Context, data []byte) error {
-	id := fmt.Sprintf("%d_%s", time.Now().UnixNano(), uuid.New().String())
-	shardID := q.getShardID(id)
-	key := fmt.Sprintf("%s/topic/shard-%d/%s", q.cfg.QueueName, shardID, id)
-
-	log.Printf("Publishing message %s to shard %d", id, shardID)
-
-	start := time.Now()
-	_, err := q.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(q.cfg.Bucket),
-		Key:    aws.String(key),
-		Body:   bytes.NewReader(data),
-	})
-	if err != nil {
-		q.cfg.Metrics.IncError("publish")
-		return fmt.Errorf("failed to publish message: %w", err)
-	}
-	q.cfg.Metrics.IncPublished()
-	q.cfg.Metrics.ObserveLatency("publish", time.Since(start))
-	return nil
-}
-
-func (q *S3Queue) getShardID(id string) int {
-	h := 0
-	for _, c := range id {
-		h = 31*h + int(c)
-	}
-	if h < 0 {
-		h = -h
-	}
-	return h % q.cfg.Shards
+	return q.publisher.Publish(ctx, data)
 }
 
 // Handler is a function that processes a message.
@@ -130,7 +110,8 @@ func (q *S3Queue) Consume(ctx context.Context, groupID string, handler Handler) 
 		startIdx := rand.Intn(q.cfg.Shards)
 		for i := 0; i < q.cfg.Shards; i++ {
 			idx := (startIdx + i) % q.cfg.Shards
-			if q.tryLockShard(ctx, groupID, idx, consumerID) {
+			acquired, err := q.locker.TryAcquire(ctx, groupID, idx, consumerID)
+			if err == nil && acquired {
 				shardID = idx
 				break
 			}
@@ -152,7 +133,7 @@ func (q *S3Queue) Consume(ctx context.Context, groupID string, handler Handler) 
 		err := q.processShard(shardCtx, groupID, shardID, handler)
 
 		cancel() // Stop heartbeat
-		q.unlockShard(ctx, groupID, shardID, consumerID)
+		q.locker.Release(ctx, groupID, shardID, consumerID)
 
 		if err != nil {
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
@@ -175,7 +156,7 @@ func (q *S3Queue) heartbeat(ctx context.Context, cancel context.CancelFunc, grou
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if !q.refreshLock(context.Background(), groupID, shardID, consumerID) {
+			if err := q.locker.Refresh(context.Background(), groupID, shardID, consumerID); err != nil {
 				log.Printf("Lost lock for shard %d, stopping processing", shardID)
 				cancel()
 				return
@@ -185,12 +166,11 @@ func (q *S3Queue) heartbeat(ctx context.Context, cancel context.CancelFunc, grou
 }
 
 func (q *S3Queue) processShard(ctx context.Context, groupID string, shardID int, handler Handler) error {
-	lastID, err := q.getCheckpoint(ctx, groupID, shardID)
+	lastID, err := q.checkpoint.Get(ctx, groupID, shardID)
 	if err != nil {
 		return fmt.Errorf("failed to get checkpoint: %w", err)
 	}
 
-	prefix := fmt.Sprintf("%s/topic/shard-%d/", q.cfg.QueueName, shardID)
 	startAfter := ""
 	if lastID != "" {
 		startAfter = fmt.Sprintf("%s/topic/shard-%d/%s", q.cfg.QueueName, shardID, lastID)
@@ -203,39 +183,33 @@ func (q *S3Queue) processShard(ctx context.Context, groupID string, shardID int,
 		default:
 		}
 
-		params := &s3.ListObjectsV2Input{
-			Bucket:  aws.String(q.cfg.Bucket),
-			Prefix:  aws.String(prefix),
-			MaxKeys: aws.Int32(100),
-		}
-		if startAfter != "" {
-			params.StartAfter = aws.String(startAfter)
-		}
-
-		resp, err := q.client.ListObjectsV2(ctx, params)
+		// List messages in the shard
+		refs, err := q.messages.List(ctx, shardID, startAfter, 100)
 		if err != nil {
-			return fmt.Errorf("failed to list objects: %w", err)
+			return fmt.Errorf("failed to list messages: %w", err)
 		}
 
-		if len(resp.Contents) == 0 {
+		if len(refs) == 0 {
 			// No messages, return to allow switching shards
 			return nil
 		}
 
-		for _, obj := range resp.Contents {
-			key := *obj.Key
-			parts := strings.Split(key, "/")
-			id := parts[len(parts)-1]
+		for _, ref := range refs {
 			// Fetch and process
 			start := time.Now()
-			err := q.processMessage(ctx, key, id, shardID, handler)
+			data, err := q.messages.Fetch(ctx, ref.Key)
+			if err != nil {
+				return fmt.Errorf("failed to fetch message: %w", err)
+			}
+
+			err = handler(ctx, Message{ID: ref.MessageID, Data: data, ShardID: shardID})
 			if err != nil {
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-					q.cfg.Metrics.IncError("consume")
-					log.Printf("Error processing message %s: %v", id, err)
+					q.metrics.IncError("consume")
+					log.Printf("Error processing message %s: %v", ref.MessageID, err)
 
 					// Handle Retry
-					count, retryErr := q.incrementRetryCount(ctx, groupID, id)
+					count, retryErr := q.retryManager.Increment(ctx, groupID, ref.MessageID)
 					if retryErr != nil {
 						if !errors.Is(retryErr, context.Canceled) {
 							log.Printf("Failed to increment retry count: %v", retryErr)
@@ -243,14 +217,14 @@ func (q *S3Queue) processShard(ctx context.Context, groupID string, shardID int,
 						return fmt.Errorf("processing failed and retry count update failed: %w", err)
 					}
 
-					if count > q.cfg.MaxRetries {
-						log.Printf("Message %s exceeded max retries (%d), moving to DLQ", id, q.cfg.MaxRetries)
-						if dlqErr := q.moveToDLQ(ctx, key, id); dlqErr != nil {
+					if q.retryManager.ShouldMoveToDLQ(count) {
+						log.Printf("Message %s exceeded max retries (%d), moving to DLQ", ref.MessageID, q.cfg.MaxRetries)
+						if dlqErr := q.messages.MoveToDLQ(ctx, ref.Key, ref.MessageID, q.cfg.DLQName); dlqErr != nil {
 							log.Printf("Failed to move to DLQ: %v", dlqErr)
 							return fmt.Errorf("processing failed and DLQ move failed: %w", err)
 						}
-						q.cfg.Metrics.IncDLQ()
-						q.deleteRetryCount(ctx, groupID, id)
+						q.metrics.IncDLQ()
+						q.retryManager.Delete(ctx, groupID, ref.MessageID)
 					} else {
 						return fmt.Errorf("processing failed (attempt %d): %w", count, err)
 					}
@@ -259,227 +233,19 @@ func (q *S3Queue) processShard(ctx context.Context, groupID string, shardID int,
 				}
 			} else {
 				// Success, clear retry count
-				q.cfg.Metrics.IncConsumed()
-				q.cfg.Metrics.ObserveLatency("consume", time.Since(start))
-				q.deleteRetryCount(ctx, groupID, id)
+				q.metrics.IncConsumed()
+				q.metrics.ObserveLatency("consume", time.Since(start))
+				q.retryManager.Delete(ctx, groupID, ref.MessageID)
 			}
 
-			lastID = id
-			startAfter = key
+			lastID = ref.MessageID
+			startAfter = ref.Key
 		}
 
-		if err := q.setCheckpoint(ctx, groupID, shardID, lastID); err != nil {
+		if err := q.checkpoint.Set(ctx, groupID, shardID, lastID); err != nil {
 			if !errors.Is(err, context.Canceled) {
 				log.Printf("Failed to save checkpoint: %v", err)
 			}
 		}
 	}
-}
-
-func (q *S3Queue) tryLockShard(ctx context.Context, groupID string, shardID int, consumerID string) bool {
-	lockKey := fmt.Sprintf("%s/locks/%s/shard-%d", q.cfg.QueueName, groupID, shardID)
-	now := time.Now().Format(time.RFC3339Nano)
-	content := fmt.Sprintf("%s|%s", now, consumerID)
-
-	// 1. Try to create new lock
-	_, err := q.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(q.cfg.Bucket),
-		Key:         aws.String(lockKey),
-		Body:        bytes.NewReader([]byte(content)),
-		IfNoneMatch: aws.String("*"),
-	})
-
-	// Verify ownership (handle eventual consistency/race)
-	if err == nil {
-		// Read back to confirm we won
-		// Small sleep to allow propagation?
-		time.Sleep(10 * time.Millisecond)
-
-		resp, err := q.client.GetObject(ctx, &s3.GetObjectInput{
-			Bucket: aws.String(q.cfg.Bucket),
-			Key:    aws.String(lockKey),
-		})
-		if err != nil {
-			return false
-		}
-		defer resp.Body.Close()
-		data, _ := io.ReadAll(resp.Body)
-		return strings.Contains(string(data), consumerID)
-	}
-
-	// 2. Check if expired
-	resp, err := q.client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(q.cfg.Bucket),
-		Key:    aws.String(lockKey),
-	})
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return false
-	}
-
-	parts := strings.Split(string(data), "|")
-	tsStr := parts[0]
-
-	ts, err := time.Parse(time.RFC3339Nano, tsStr)
-	if err != nil {
-		// Invalid timestamp, assume expired and steal
-		ts = time.Time{}
-	}
-
-	if time.Since(ts) > q.cfg.LockTTL {
-		// Expired, try to steal with IfMatch ETag
-		_, err := q.client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:  aws.String(q.cfg.Bucket),
-			Key:     aws.String(lockKey),
-			Body:    bytes.NewReader([]byte(content)),
-			IfMatch: resp.ETag,
-		})
-		return err == nil
-	}
-
-	return false
-}
-
-func (q *S3Queue) unlockShard(ctx context.Context, groupID string, shardID int, consumerID string) {
-	lockKey := fmt.Sprintf("%s/locks/%s/shard-%d", q.cfg.QueueName, groupID, shardID)
-
-	// Only delete if we own it?
-	// For simplicity, just delete. If we lost lock, we might delete someone else's lock,
-	// but heartbeat handles that.
-	// Ideally check consumerID.
-	q.client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(q.cfg.Bucket),
-		Key:    aws.String(lockKey),
-	})
-}
-
-func (q *S3Queue) refreshLock(ctx context.Context, groupID string, shardID int, consumerID string) bool {
-	lockKey := fmt.Sprintf("%s/locks/%s/shard-%d", q.cfg.QueueName, groupID, shardID)
-	now := time.Now().Format(time.RFC3339Nano)
-	content := fmt.Sprintf("%s|%s", now, consumerID)
-
-	_, err := q.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(q.cfg.Bucket),
-		Key:    aws.String(lockKey),
-		Body:   bytes.NewReader([]byte(content)),
-	})
-	return err == nil
-}
-
-func (q *S3Queue) getCheckpoint(ctx context.Context, groupID string, shardID int) (string, error) {
-	key := fmt.Sprintf("%s/checkpoints/%s/shard-%d", q.cfg.QueueName, groupID, shardID)
-	resp, err := q.client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(q.cfg.Bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		if strings.Contains(err.Error(), "NoSuchKey") {
-			return "", nil
-		}
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
-}
-
-func (q *S3Queue) setCheckpoint(ctx context.Context, groupID string, shardID int, id string) error {
-	key := fmt.Sprintf("%s/checkpoints/%s/shard-%d", q.cfg.QueueName, groupID, shardID)
-	_, err := q.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(q.cfg.Bucket),
-		Key:    aws.String(key),
-		Body:   bytes.NewReader([]byte(id)),
-	})
-	return err
-}
-
-func (q *S3Queue) processMessage(ctx context.Context, key, id string, shardID int, handler Handler) error {
-	resp, err := q.client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(q.cfg.Bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		return fmt.Errorf("failed to get message body: %w", err)
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read message body: %w", err)
-	}
-
-	return handler(ctx, Message{ID: id, Data: data, ShardID: shardID})
-}
-
-func (q *S3Queue) getRetryCount(ctx context.Context, groupID, id string) (int, error) {
-	key := fmt.Sprintf("%s/retries/%s/%s", q.cfg.QueueName, groupID, id)
-	resp, err := q.client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(q.cfg.Bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		if strings.Contains(err.Error(), "NoSuchKey") {
-			return 0, nil
-		}
-		return 0, err
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, err
-	}
-	var count int
-	fmt.Sscanf(string(data), "%d", &count)
-	return count, nil
-}
-
-func (q *S3Queue) incrementRetryCount(ctx context.Context, groupID, id string) (int, error) {
-	count, err := q.getRetryCount(ctx, groupID, id)
-	if err != nil {
-		return 0, err
-	}
-	count++
-	key := fmt.Sprintf("%s/retries/%s/%s", q.cfg.QueueName, groupID, id)
-	_, err = q.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(q.cfg.Bucket),
-		Key:    aws.String(key),
-		Body:   bytes.NewReader([]byte(fmt.Sprintf("%d", count))),
-	})
-	return count, err
-}
-
-func (q *S3Queue) deleteRetryCount(ctx context.Context, groupID, id string) {
-	key := fmt.Sprintf("%s/retries/%s/%s", q.cfg.QueueName, groupID, id)
-	q.client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(q.cfg.Bucket),
-		Key:    aws.String(key),
-	})
-}
-
-func (q *S3Queue) moveToDLQ(ctx context.Context, key, id string) error {
-	if q.cfg.DLQName == "" {
-		return fmt.Errorf("DLQ not configured")
-	}
-
-	// Copy object to DLQ
-	dlqKey := fmt.Sprintf("%s/%s", q.cfg.DLQName, id)
-	_, err := q.client.CopyObject(ctx, &s3.CopyObjectInput{
-		Bucket:     aws.String(q.cfg.Bucket),
-		CopySource: aws.String(fmt.Sprintf("%s/%s", q.cfg.Bucket, key)),
-		Key:        aws.String(dlqKey),
-	})
-	if err != nil {
-		return fmt.Errorf("failed to copy to DLQ: %w", err)
-	}
-
-	return nil
 }

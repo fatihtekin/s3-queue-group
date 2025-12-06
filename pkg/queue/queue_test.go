@@ -297,26 +297,24 @@ func TestS3Queue_Integration(t *testing.T) {
 	}
 }
 
+// TestLockExpiration tests lock expiration through the public API
 func TestLockExpiration(t *testing.T) {
 	mockS3 := NewMockS3Client()
-	q := NewS3Queue(mockS3, S3QueueConfig{
-		Bucket:    "test-bucket",
-		QueueName: "test-queue",
-		Shards:    1,
-		LockTTL:   100 * time.Millisecond,
-	})
+	locker := NewS3Locker(mockS3, "test-bucket", "test-queue", 100*time.Millisecond)
 
 	ctx := context.Background()
 	groupID := "group-1"
 	shardID := 0
 
-	// 1. Acquire lock manually
-	if !q.tryLockShard(ctx, groupID, shardID, "test-consumer") {
+	// 1. Acquire lock
+	acquired, err := locker.TryAcquire(ctx, groupID, shardID, "test-consumer")
+	if err != nil || !acquired {
 		t.Fatal("Failed to acquire lock")
 	}
 
 	// 2. Try to acquire again immediately (should fail)
-	if q.tryLockShard(ctx, groupID, shardID, "test-consumer-2") {
+	acquired, err = locker.TryAcquire(ctx, groupID, shardID, "test-consumer-2")
+	if err != nil || acquired {
 		t.Fatal("Should not be able to acquire lock immediately")
 	}
 
@@ -324,32 +322,47 @@ func TestLockExpiration(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// 4. Try to acquire again (should succeed via stealing)
-	if !q.tryLockShard(ctx, groupID, shardID, "test-consumer") {
+	acquired, err = locker.TryAcquire(ctx, groupID, shardID, "test-consumer-3")
+	if err != nil || !acquired {
 		t.Fatal("Failed to acquire expired lock")
 	}
 }
 
+// TestHeartbeat tests that heartbeat keeps locks alive
 func TestHeartbeat(t *testing.T) {
 	mockS3 := NewMockS3Client()
-	q := NewS3Queue(mockS3, S3QueueConfig{
-		Bucket:    "test-bucket",
-		QueueName: "test-queue",
-		Shards:    1,
-		LockTTL:   200 * time.Millisecond,
-	})
+	locker := NewS3Locker(mockS3, "test-bucket", "test-queue", 200*time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	groupID := "group-1"
 	shardID := 0
+	consumerID := "test-consumer"
 
-	// 1. Start heartbeat
-	go q.heartbeat(ctx, cancel, groupID, shardID, "test-consumer")
+	// 1. Acquire lock first
+	acquired, err := locker.TryAcquire(ctx, groupID, shardID, consumerID)
+	if err != nil || !acquired {
+		t.Fatal("Failed to acquire lock")
+	}
 
-	// 2. Wait longer than TTL (heartbeat should keep it alive)
+	// 2. Start refreshing
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				locker.Refresh(ctx, groupID, shardID, consumerID)
+			}
+		}
+	}()
+
+	// 3. Wait longer than TTL (heartbeat should keep it alive)
 	time.Sleep(500 * time.Millisecond)
 
-	// 3. Check lock timestamp
+	// 4. Check lock timestamp
 	lockKey := fmt.Sprintf("test-queue/locks/%s/shard-%d", groupID, shardID)
 	resp, err := mockS3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String("test-bucket"),
@@ -440,8 +453,8 @@ func TestCleanup(t *testing.T) {
 	}
 	mockS3.mu.Unlock()
 
-	// 4. Run Cleanup
-	if err := q.Cleanup(ctx, 1*time.Hour); err != nil {
+	// 4. Run Cleanup (now requires S3API client parameter)
+	if err := q.Cleanup(ctx, mockS3, 1*time.Hour); err != nil {
 		t.Fatalf("Cleanup failed: %v", err)
 	}
 

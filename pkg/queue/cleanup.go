@@ -12,13 +12,14 @@ import (
 )
 
 // Cleanup deletes messages older than the retention period.
-func (q *S3Queue) Cleanup(ctx context.Context, retention time.Duration) error {
+// Note: This method requires direct S3 access for batch deletion efficiency.
+func (q *S3Queue) Cleanup(ctx context.Context, client S3API, retention time.Duration) error {
 	cutoff := time.Now().Add(-retention)
 	log.Printf("Starting cleanup for messages older than %v", cutoff)
 
 	for i := 0; i < q.cfg.Shards; i++ {
 		prefix := fmt.Sprintf("%s/topic/shard-%d/", q.cfg.QueueName, i)
-		paginator := s3.NewListObjectsV2Paginator(q.client, &s3.ListObjectsV2Input{
+		paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 			Bucket: aws.String(q.cfg.Bucket),
 			Prefix: aws.String(prefix),
 		})
@@ -38,7 +39,7 @@ func (q *S3Queue) Cleanup(ctx context.Context, retention time.Duration) error {
 
 			if len(toDelete) > 0 {
 				log.Printf("Deleting %d old messages from shard %d", len(toDelete), i)
-				_, err := q.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+				_, err := client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 					Bucket: aws.String(q.cfg.Bucket),
 					Delete: &types.Delete{
 						Objects: toDelete,
