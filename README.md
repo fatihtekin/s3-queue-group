@@ -1,9 +1,9 @@
-# S3 Queue Group
+# S3 Brokerless Queue Group
 
 A distributed, log-structured message queue implementation using Amazon S3 as the storage backend. This system provides reliable message delivery with consumer groups, automatic failover, retries, and dead-letter queue (DLQ) support.
 
 ## Features
-
+- No need to maintain/run broker infrastructure
 - **Distributed Architecture**: Multiple producers and consumers can operate concurrently
 - **Consumer Groups**: Messages are processed exactly once per consumer group
 - **Sharding**: Horizontal scalability through configurable sharding
