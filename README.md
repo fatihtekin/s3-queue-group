@@ -332,27 +332,11 @@ S3QueueConfig{
 
 ## Limitations
 
-- **Steady-State Performance**: Once a consumer has a shard lock and is processing messages:
-  - **Per-message latency**: Sub-second (often sub-millisecond) within batches
-  - **Throughput**: Hundreds to thousands of messages per second per consumer
-  - Messages are fetched in batches of up to 100 via `ListObjectsV2`
 - **Cold Start**: Initial lock acquisition and first message fetch takes 200ms-1.5s
 - **API Rate Limits**: Subject to S3 rate limits (3,500 PUT/s, 5,500 GET/s per prefix)
 - **Ordering**: Messages are ordered within a shard, but not across shards
 - **Consistency**: S3's eventual consistency may cause brief inconsistencies
-
-## Use Cases
-
-This queue excels at:
-- ✅ **High-throughput batch processing** (thousands of messages/second once consuming)
-- ✅ Asynchronous job processing and task queues
-- ✅ Event-driven architectures with multiple consumer groups
-- ✅ Data pipeline coordination and workflow orchestration
-- ✅ Audit log processing and compliance workflows
-- ✅ ETL and data transformation pipelines
-- ✅ Distributed systems requiring exactly-once processing per consumer group
-
-**Performance Profile**: Optimized for sustained high-throughput workloads where consumers continuously process messages. The batch-oriented design means once a consumer starts processing, it achieves excellent per-message latency and throughput.
+starts processing, it achieves excellent per-message latency and throughput.
 
 ## Contributing
 
@@ -368,6 +352,5 @@ MIT License - see LICENSE file for details
 
 ## Acknowledgments
 
-Built with:
 - [AWS SDK for Go v2](https://github.com/aws/aws-sdk-go-v2)
 - [testcontainers-go](https://github.com/testcontainers/testcontainers-go) for integration testing
